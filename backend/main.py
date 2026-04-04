@@ -2,12 +2,14 @@
 
 Endpoints:
   POST /analyze         — Analyze a product by barcode or name
+  POST /identify-image  — Identify a product from a photo using Claude Vision
   GET  /search          — Search products by name
   GET  /health          — Health check
 """
 
 import os
 import json
+import base64
 from pathlib import Path
 import httpx
 import anthropic
@@ -51,6 +53,11 @@ class AnalyzeRequest(BaseModel):
     barcode: str | None = None
     product_name: str | None = None
     brand: str | None = None
+
+
+class IdentifyImageRequest(BaseModel):
+    image: str  # base64-encoded image data (with or without data URI prefix)
+    media_type: str = "image/jpeg"  # image/jpeg, image/png, image/webp
 
 
 class MaterialRisk(BaseModel):
@@ -457,3 +464,71 @@ async def search(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1,
         })
 
     return {"query": q, "count": len(results), "products": results}
+
+
+@app.post("/identify-image")
+async def identify_image(req: IdentifyImageRequest):
+    """Identify a product from a photo using Claude Vision.
+
+    Accepts a base64-encoded image. Returns the identified product name,
+    brand, and category so the frontend can proceed to /analyze.
+    """
+    if not claude:
+        raise HTTPException(503, "AI image recognition requires Claude API key")
+
+    # Strip data URI prefix if present (e.g. "data:image/jpeg;base64,...")
+    image_data = req.image
+    if "," in image_data:
+        image_data = image_data.split(",", 1)[1]
+
+    # Determine media type
+    media_type = req.media_type
+    if req.image.startswith("data:"):
+        media_type = req.image.split(";")[0].split(":")[1]
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": """Identify this product. What is it? Return ONLY valid JSON:
+{
+  "product_name": "<specific product name>",
+  "brand": "<brand name or 'Unknown'>",
+  "category": "<category like Food, Clothing, Electronics, Personal Care, Footwear, Home, etc.>"
+}
+
+Be specific with the product name. If you can see the brand, include it.
+If it's a barcode, try to identify what product it belongs to.
+Output ONLY the JSON, nothing else.""",
+                    },
+                ],
+            }],
+        )
+        text = response.content[0].text.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            return {
+                "product_name": data.get("product_name", "Unknown Product"),
+                "brand": data.get("brand", "Unknown"),
+                "category": data.get("category", "General"),
+            }
+        raise HTTPException(500, "Could not parse AI response")
+    except anthropic.APIError as e:
+        raise HTTPException(502, f"AI service error: {str(e)}")
+    except json.JSONDecodeError:
+        raise HTTPException(500, "AI returned invalid format")

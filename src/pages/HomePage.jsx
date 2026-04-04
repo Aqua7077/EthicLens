@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2 } from 'lucide-react'
-import { triggerBarcodeScan, triggerCamera, onBarcodeResult } from '../appInventorBridge'
 import { searchProducts } from '../api'
+import ScanModal from '../components/ScanModal'
 
 const recentSearches = [
   {
@@ -135,6 +135,8 @@ export default function HomePage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState(null)
   const [searching, setSearching] = useState(false)
+  const [scanOpen, setScanOpen] = useState(false)
+  const [scanTab, setScanTab] = useState('barcode')
 
   // Handle search submission
   const handleSearch = useCallback(async () => {
@@ -158,12 +160,10 @@ export default function HomePage() {
     }
   }, [searchQuery, navigate])
 
-  // Listen for barcode results from App Inventor bridge
-  useEffect(() => {
-    return onBarcodeResult((barcode) => {
-      navigate(`/result?barcode=${encodeURIComponent(barcode)}`)
-    })
-  }, [navigate])
+  const openScanner = (tab) => {
+    setScanTab(tab)
+    setScanOpen(true)
+  }
 
   return (
     <div className="min-h-dvh">
@@ -183,7 +183,7 @@ export default function HomePage() {
               </h1>
             </div>
             <button
-              onClick={triggerBarcodeScan}
+              onClick={() => openScanner('barcode')}
               className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
                              hover:bg-gray-100 transition-colors">
               <ScanBarcode className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
@@ -304,7 +304,7 @@ export default function HomePage() {
               Point your camera at any product to instantly check its ethical sourcing and supply chain transparency.
             </p>
             <button
-              onClick={triggerCamera}
+              onClick={() => openScanner('camera')}
               className="flex items-center gap-2 bg-white/20 hover:bg-white/30 backdrop-blur-sm
                              text-white text-sm font-medium px-4 py-2.5 rounded-xl transition-all
                              active:scale-95">
@@ -338,6 +338,12 @@ export default function HomePage() {
 
       {/* Bottom padding */}
       <div className="h-8" />
+
+      <ScanModal
+        isOpen={scanOpen}
+        onClose={() => setScanOpen(false)}
+        defaultTab={scanTab}
+      />
     </div>
   )
 }

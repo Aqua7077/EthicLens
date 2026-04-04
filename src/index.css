@@ -34,7 +34,7 @@ body {
   min-height: 100dvh;
   background: #ffffff;
   position: relative;
-  overflow-x: hidden;
+  overflow-x: clip;
   box-shadow: 0 0 40px rgba(0, 0, 0, 0.08);
 }
 
@@ -106,3 +106,25 @@ html {
 .fade-up-delay-2 { animation-delay: 0.2s; opacity: 0; }
 .fade-up-delay-3 { animation-delay: 0.3s; opacity: 0; }
 .fade-up-delay-4 { animation-delay: 0.4s; opacity: 0; }
+
+/* Slide up animation for bottom sheet */
+@keyframes slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Fix html5-qrcode scanner styling */
+#barcode-reader video {
+  border-radius: 16px !important;
+  object-fit: cover !important;
+}
+#barcode-reader img[alt="Info icon"] {
+  display: none !important;
+}
+#barcode-reader__dashboard {
+  display: none !important;
+}

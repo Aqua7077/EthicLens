@@ -37,6 +37,25 @@ export async function searchProducts(query, limit = 10) {
 }
 
 /**
+ * Identify a product from a photo using Claude Vision.
+ * @param {string} base64Image - base64-encoded image (with or without data URI prefix)
+ * @param {string} mediaType - image/jpeg, image/png, etc.
+ * @returns {Promise<{ product_name: string, brand: string, category: string }>}
+ */
+export async function identifyImage(base64Image, mediaType = 'image/jpeg') {
+  const resp = await fetch(`${API_BASE}/identify-image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ image: base64Image, media_type: mediaType }),
+  })
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}))
+    throw new Error(err.detail || `Image recognition failed (${resp.status})`)
+  }
+  return resp.json()
+}
+
+/**
  * Health check.
  */
 export async function healthCheck() {
