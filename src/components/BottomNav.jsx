@@ -1,5 +1,7 @@
+import { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { Home, Newspaper, Info, Camera } from 'lucide-react'
+import { triggerCamera, onProductResult } from '../appInventorBridge'
 
 const navItems = [
   { path: '/', icon: Home, label: 'Home' },
@@ -11,12 +13,19 @@ export default function BottomNav() {
   const location = useLocation()
   const navigate = useNavigate()
 
+  // Listen for product name navigation from camera/prompt
+  useEffect(() => {
+    return onProductResult((name) => {
+      navigate(`/result?name=${encodeURIComponent(name)}`)
+    })
+  }, [navigate])
+
   return (
     <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[430px] z-50">
       {/* Floating camera button */}
       <div className="absolute -top-7 left-1/2 -translate-x-1/2 z-10">
         <button
-          onClick={() => navigate('/')}
+          onClick={triggerCamera}
           className="w-14 h-14 rounded-full bg-gradient-to-br from-emerald-500 to-emerald-600
                      flex items-center justify-center shadow-lg shadow-emerald-500/30
                      pulse-glow active:scale-95 transition-transform"

@@ -1,6 +1,8 @@
-import { useState } from 'react'
-import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X } from 'lucide-react'
-import { triggerBarcodeScan, triggerCamera } from '../appInventorBridge'
+import { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
+import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2 } from 'lucide-react'
+import { triggerBarcodeScan, triggerCamera, onBarcodeResult } from '../appInventorBridge'
+import { searchProducts } from '../api'
 
 const recentSearches = [
   {
@@ -88,11 +90,12 @@ function ScoreRing({ score, size = 36 }) {
   )
 }
 
-function ProductCard({ product, index }) {
+function ProductCard({ product, index, onClick }) {
   return (
     <div
-      className="break-inside-avoid mb-3 group fade-up"
+      className="break-inside-avoid mb-3 group fade-up cursor-pointer"
       style={{ animationDelay: `${index * 0.08}s` }}
+      onClick={onClick}
     >
       <div className="rounded-2xl overflow-hidden bg-white shadow-sm border border-gray-100
                       hover:shadow-md transition-all duration-300 active:scale-[0.98]">
@@ -127,8 +130,40 @@ function ProductCard({ product, index }) {
 }
 
 export default function HomePage() {
+  const navigate = useNavigate()
   const [searchFocused, setSearchFocused] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState(null)
+  const [searching, setSearching] = useState(false)
+
+  // Handle search submission
+  const handleSearch = useCallback(async () => {
+    const q = searchQuery.trim()
+    if (!q) return
+
+    // If it looks like a barcode (all digits, 8-13 chars), go straight to analysis
+    if (/^\d{8,13}$/.test(q)) {
+      navigate(`/result?barcode=${encodeURIComponent(q)}`)
+      return
+    }
+
+    setSearching(true)
+    try {
+      const data = await searchProducts(q, 8)
+      setSearchResults(data.products)
+    } catch {
+      setSearchResults([])
+    } finally {
+      setSearching(false)
+    }
+  }, [searchQuery, navigate])
+
+  // Listen for barcode results from App Inventor bridge
+  useEffect(() => {
+    return onBarcodeResult((barcode) => {
+      navigate(`/result?barcode=${encodeURIComponent(barcode)}`)
+    })
+  }, [navigate])
 
   return (
     <div className="min-h-dvh">
@@ -157,27 +192,80 @@ export default function HomePage() {
 
           {/* Search bar */}
           <div className={`relative mb-3 transition-all duration-300 ${searchFocused ? 'scale-[1.02]' : ''}`}>
-            <div className={`flex items-center gap-2 px-4 py-2.5 rounded-2xl border transition-all duration-300
-              ${searchFocused
-                ? 'border-emerald-400 bg-white shadow-lg shadow-emerald-500/10'
-                : 'border-gray-200 bg-gray-50'
-              }`}>
-              <Search className={`w-4 h-4 transition-colors ${searchFocused ? 'text-emerald-500' : 'text-gray-400'}`} />
-              <input
-                type="text"
-                placeholder="Search products or brands..."
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onFocus={() => setSearchFocused(true)}
-                onBlur={() => setSearchFocused(false)}
-                className="flex-1 bg-transparent text-sm text-gray-900 placeholder-gray-400 outline-none"
-              />
-              {searchQuery && (
-                <button onClick={() => setSearchQuery('')}>
-                  <X className="w-4 h-4 text-gray-400" />
-                </button>
-              )}
-            </div>
+            <form onSubmit={(e) => { e.preventDefault(); handleSearch() }}>
+              <div className={`flex items-center gap-2 px-4 py-2.5 rounded-2xl border transition-all duration-300
+                ${searchFocused
+                  ? 'border-emerald-400 bg-white shadow-lg shadow-emerald-500/10'
+                  : 'border-gray-200 bg-gray-50'
+                }`}>
+                <Search className={`w-4 h-4 transition-colors ${searchFocused ? 'text-emerald-500' : 'text-gray-400'}`} />
+                <input
+                  type="text"
+                  placeholder="Search products, brands, or scan barcode..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  onFocus={() => setSearchFocused(true)}
+                  onBlur={() => setTimeout(() => setSearchFocused(false), 200)}
+                  className="flex-1 bg-transparent text-sm text-gray-900 placeholder-gray-400 outline-none"
+                />
+                {searching && <Loader2 className="w-4 h-4 text-emerald-500 animate-spin" />}
+                {searchQuery && !searching && (
+                  <button type="button" onClick={() => { setSearchQuery(''); setSearchResults(null) }}>
+                    <X className="w-4 h-4 text-gray-400" />
+                  </button>
+                )}
+              </div>
+            </form>
+
+            {/* Search Results Dropdown */}
+            {searchResults && (
+              <div className="absolute top-full left-0 right-0 mt-1 bg-white rounded-2xl shadow-xl border border-gray-100 overflow-hidden z-50 max-h-[60vh] overflow-y-auto">
+                {searchResults.length === 0 ? (
+                  <div className="p-4 text-center">
+                    <p className="text-sm text-gray-500">No products found</p>
+                    <button
+                      onClick={() => navigate(`/result?name=${encodeURIComponent(searchQuery)}`)}
+                      className="text-xs text-emerald-600 font-medium mt-1"
+                    >
+                      Analyze "{searchQuery}" with AI instead
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    {searchResults.map((p) => (
+                      <button
+                        key={p.barcode}
+                        onClick={() => {
+                          setSearchResults(null)
+                          setSearchQuery('')
+                          navigate(`/result?barcode=${p.barcode}`)
+                        }}
+                        className="w-full flex items-center gap-3 p-3 hover:bg-gray-50 transition-colors text-left border-b border-gray-50 last:border-0"
+                      >
+                        {p.image_url ? (
+                          <img src={p.image_url} alt="" className="w-10 h-10 rounded-lg object-cover bg-gray-100" />
+                        ) : (
+                          <div className="w-10 h-10 rounded-lg bg-gray-100 flex items-center justify-center">
+                            <Leaf className="w-4 h-4 text-gray-300" />
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-gray-900 truncate">{p.name}</p>
+                          <p className="text-[11px] text-gray-500 truncate">{p.brand}</p>
+                        </div>
+                        <ChevronRight className="w-4 h-4 text-gray-300 flex-shrink-0" />
+                      </button>
+                    ))}
+                    <button
+                      onClick={() => navigate(`/result?name=${encodeURIComponent(searchQuery)}`)}
+                      className="w-full p-3 text-center text-xs text-emerald-600 font-medium hover:bg-emerald-50 transition-colors"
+                    >
+                      Analyze "{searchQuery}" with AI
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -238,7 +326,12 @@ export default function HomePage() {
         {/* Masonry Grid */}
         <div className="columns-2 gap-3">
           {recentSearches.map((product, index) => (
-            <ProductCard key={product.id} product={product} index={index} />
+            <ProductCard
+              key={product.id}
+              product={product}
+              index={index}
+              onClick={() => navigate(`/result?name=${encodeURIComponent(product.name)}&brand=${encodeURIComponent(product.brand)}`)}
+            />
           ))}
         </div>
       </div>
