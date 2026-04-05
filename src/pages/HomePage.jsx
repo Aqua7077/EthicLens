@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2, User } from 'lucide-react'
+import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2, LogOut } from 'lucide-react'
 import { searchProducts } from '../api'
 import ScanModal from '../components/ScanModal'
 import { useAuth } from '../contexts/AuthContext'
@@ -80,7 +80,7 @@ function ProductCard({ product, index, onClick }) {
 
 export default function HomePage() {
   const navigate = useNavigate()
-  const { user, signIn } = useAuth()
+  const { user, signOut } = useAuth()
   const [searchFocused, setSearchFocused] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState(null)
@@ -93,37 +93,57 @@ export default function HomePage() {
   const [recentScans, setRecentScans] = useState([])
   const [loadingScans, setLoadingScans] = useState(false)
 
-  // Fetch user stats and recent scans when user changes
-  useEffect(() => {
+  // Fetch user data — refreshes every time page gets focus (back from result page)
+  const fetchUserData = useCallback(async () => {
     if (!user) {
       setStats(null)
       setRecentScans([])
       return
     }
+    setLoadingScans(true)
+    try {
+      const [userStats, scans] = await Promise.all([
+        getUserStats(user.uid),
+        getRecentScans(user.uid, 6),
+      ])
+      setStats(userStats)
+      setRecentScans(scans)
+    } catch (err) {
+      console.error('Failed to fetch user data:', err)
+    } finally {
+      setLoadingScans(false)
+    }
+  }, [user])
 
-    let cancelled = false
+  // Initial load
+  useEffect(() => {
+    fetchUserData()
+  }, [fetchUserData])
 
-    async function fetchData() {
-      setLoadingScans(true)
-      try {
-        const [userStats, scans] = await Promise.all([
-          getUserStats(user.uid),
-          getRecentScans(user.uid, 6),
-        ])
-        if (!cancelled) {
-          setStats(userStats)
-          setRecentScans(scans)
-        }
-      } catch (err) {
-        console.error('Failed to fetch user data:', err)
-      } finally {
-        if (!cancelled) setLoadingScans(false)
+  // Re-fetch when page becomes visible (user navigates back from result)
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        fetchUserData()
       }
     }
+    document.addEventListener('visibilitychange', handleVisibility)
 
-    fetchData()
-    return () => { cancelled = true }
-  }, [user])
+    // Also re-fetch on focus (covers in-app navigation)
+    const handleFocus = () => fetchUserData()
+    window.addEventListener('focus', handleFocus)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [fetchUserData])
+
+  // Also re-fetch when component mounts (handles React Router navigation back)
+  useEffect(() => {
+    fetchUserData()
+  // Using location as implicit dep: component re-mounts or state changes trigger refresh
+  })
 
   // Handle search submission
   const handleSearch = useCallback(async () => {
@@ -200,27 +220,36 @@ export default function HomePage() {
                                hover:bg-gray-100 transition-colors">
                 <ScanBarcode className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
               </button>
-              {user ? (
-                <button
-                  onClick={() => navigate('/profile')}
-                  className="w-8 h-8 rounded-full overflow-hidden border-2 border-emerald-400 flex-shrink-0"
-                >
-                  <img
-                    src={user.photoURL}
-                    alt="Profile"
-                    className="w-full h-full object-cover"
-                    referrerPolicy="no-referrer"
-                  />
-                </button>
-              ) : (
-                <button
-                  onClick={signIn}
-                  className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
-                                 hover:bg-gray-100 transition-colors"
-                >
-                  <User className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
-                </button>
+              {user && (
+                <div className="relative group">
+                  <button
+                    className="w-8 h-8 rounded-full overflow-hidden border-2 border-emerald-400 flex-shrink-0"
+                  >
+                    {user.photoURL ? (
+                      <img
+                        src={user.photoURL}
+                        alt="Profile"
+                        className="w-full h-full object-cover"
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <div className="w-full h-full bg-emerald-100 flex items-center justify-center">
+                        <span className="text-xs font-bold text-emerald-600">
+                          {(user.displayName || user.email || '?')[0].toUpperCase()}
+                        </span>
+                      </div>
+                    )}
+                  </button>
+                </div>
               )}
+              <button
+                onClick={signOut}
+                className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
+                               hover:bg-red-50 transition-colors"
+                title="Sign out"
+              >
+                <LogOut className="w-4 h-4 text-gray-500" strokeWidth={1.8} />
+              </button>
             </div>
           </div>
 

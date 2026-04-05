@@ -7,6 +7,7 @@ const API_BASE = import.meta.env.VITE_API_URL || 'https://ethiclens-api.onrender
 
 /**
  * Analyze a product by barcode or name.
+ * Returns full analysis with score_trace for transparency.
  */
 export async function analyzeProduct({ barcode, product_name, brand } = {}) {
   const resp = await fetch(`${API_BASE}/analyze`, {
@@ -48,9 +49,9 @@ export async function identifyImage(base64Image, mediaType = 'image/jpeg') {
 }
 
 /**
- * Fetch real-time news by category.
+ * Fetch real-time news by category (25 articles default).
  */
-export async function fetchNews(category = 'all', limit = 10) {
+export async function fetchNews(category = 'all', limit = 25) {
   const params = new URLSearchParams({ category, limit: String(limit) })
   const resp = await fetch(`${API_BASE}/news?${params}`)
   if (!resp.ok) throw new Error(`News fetch failed (${resp.status})`)
@@ -60,7 +61,7 @@ export async function fetchNews(category = 'all', limit = 10) {
 /**
  * Fetch personalized "For You" news based on scan history.
  */
-export async function fetchForYouNews(materials = [], categories = [], limit = 10) {
+export async function fetchForYouNews(materials = [], categories = [], limit = 25) {
   const params = new URLSearchParams({
     materials: materials.join(','),
     categories: categories.join(','),

@@ -3,6 +3,7 @@ import {
   onAuthStateChanged,
   signInWithPopup,
   signInWithRedirect,
+  getRedirectResult,
   signOut as firebaseSignOut,
 } from 'firebase/auth'
 import { doc, getDoc, setDoc, serverTimestamp } from 'firebase/firestore'
@@ -21,21 +22,28 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
+    // Check for redirect result first (handles mobile redirect flow)
+    getRedirectResult(auth).catch(() => {})
+
     const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       if (firebaseUser) {
         // Ensure user doc exists in Firestore
         const userRef = doc(db, 'users', firebaseUser.uid)
-        const snap = await getDoc(userRef)
-        if (!snap.exists()) {
-          await setDoc(userRef, {
-            displayName: firebaseUser.displayName || '',
-            email: firebaseUser.email || '',
-            photoURL: firebaseUser.photoURL || '',
-            createdAt: serverTimestamp(),
-            scanCount: 0,
-            ethicalFinds: 0,
-            totalScore: 0,
-          })
+        try {
+          const snap = await getDoc(userRef)
+          if (!snap.exists()) {
+            await setDoc(userRef, {
+              displayName: firebaseUser.displayName || '',
+              email: firebaseUser.email || '',
+              photoURL: firebaseUser.photoURL || '',
+              createdAt: serverTimestamp(),
+              scanCount: 0,
+              ethicalFinds: 0,
+              totalScore: 0,
+            })
+          }
+        } catch (err) {
+          console.warn('Firestore user doc error:', err)
         }
         setUser(firebaseUser)
       } else {
@@ -47,15 +55,26 @@ export function AuthProvider({ children }) {
   }, [])
 
   const signIn = async () => {
-    try {
-      // Try popup first (works on desktop)
-      await signInWithPopup(auth, googleProvider)
-    } catch (err) {
-      if (err.code === 'auth/popup-blocked' || err.code === 'auth/popup-closed-by-user') {
-        // Fallback to redirect (works on mobile)
-        await signInWithRedirect(auth, googleProvider)
-      } else {
-        throw err
+    // Detect mobile/iOS where popup often fails
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent)
+    const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent)
+
+    if (isMobile || isIOS) {
+      // Mobile: use redirect directly (most reliable on iOS Safari)
+      await signInWithRedirect(auth, googleProvider)
+    } else {
+      try {
+        await signInWithPopup(auth, googleProvider)
+      } catch (err) {
+        if (
+          err.code === 'auth/popup-blocked' ||
+          err.code === 'auth/popup-closed-by-user' ||
+          err.code === 'auth/cancelled-popup-request'
+        ) {
+          await signInWithRedirect(auth, googleProvider)
+        } else {
+          throw err
+        }
       }
     }
   }

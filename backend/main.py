@@ -1,7 +1,7 @@
 """EthicLens AI Backend — FastAPI + Claude API.
 
 Endpoints:
-  POST /analyze         — Analyze a product by barcode or name
+  POST /analyze         — Analyze a product by barcode or name (full transparency trace)
   POST /identify-image  — Identify a product from a photo using Claude Vision
   GET  /search          — Search products by name
   GET  /news            — Fetch real-time sustainability news
@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from ilab_data import get_material_risk, resolve_material
+from ilab_data import get_material_risk, resolve_material, ILAB_RISK_DB
 
 # Load .env from the same directory as this file
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
@@ -33,7 +33,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 app = FastAPI(
     title="EthicLens AI",
     description="Ethical supply chain transparency API",
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -44,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Clients ──────────────────────────────────────────────────────────
+# -- Clients ---------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 OFF_BASE = "https://world.openfoodfacts.org"
@@ -53,9 +53,9 @@ OFF_HEADERS = {"User-Agent": "EthicLensAI/1.0 (ethiclens-appathon@mit.edu)"}
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 http = httpx.AsyncClient(timeout=15, headers=OFF_HEADERS)
 
-# ── News Cache & Config ──────────────────────────────────────────────
+# -- News Cache & Config ----------------------------------------------------
 
-NEWS_CACHE: dict[str, tuple[float, list]] = {}  # key -> (timestamp, articles)
+NEWS_CACHE: dict[str, tuple[float, list]] = {}
 NEWS_CACHE_TTL = 1800  # 30 minutes
 
 NEWS_QUERIES: dict[str, str] = {
@@ -69,7 +69,7 @@ NEWS_QUERIES: dict[str, str] = {
 }
 
 
-# ── Models ───────────────────────────────────────────────────────────
+# -- Models -----------------------------------------------------------------
 
 class AnalyzeRequest(BaseModel):
     barcode: str | None = None
@@ -78,8 +78,68 @@ class AnalyzeRequest(BaseModel):
 
 
 class IdentifyImageRequest(BaseModel):
-    image: str  # base64-encoded image data (with or without data URI prefix)
-    media_type: str = "image/jpeg"  # image/jpeg, image/png, image/webp
+    image: str
+    media_type: str = "image/jpeg"
+
+
+class CountryRiskDetail(BaseModel):
+    name: str
+    weight: float
+    base_score: float
+    ilab_adjustment: float
+    final_score: float
+    risk_types: list[str]
+    severity: int
+
+
+class MaterialRiskBreakdown(BaseModel):
+    dol_listed: bool
+    ilo_sector_score: float
+
+
+class MaterialRiskDetail(BaseModel):
+    name: str
+    material_weight: float
+    material_risk: dict  # {value, breakdown: {dol_score, ilo_sector_score}}
+    country_risk: dict   # {value, countries: [...]}
+    stage_weight: float
+    contribution: float
+
+
+class SupplyChainComponent(BaseModel):
+    value: float
+    materials: list[MaterialRiskDetail]
+
+
+class MitigationFactors(BaseModel):
+    supplier_list: bool
+    certifications: bool
+    esg_report: bool
+    traceability: bool
+
+
+class MitigationComponent(BaseModel):
+    value: float
+    factors: MitigationFactors
+
+
+class ControversyComponent(BaseModel):
+    value: float
+    article_count: int
+
+
+class ScoreComponents(BaseModel):
+    supply_chain_risk: SupplyChainComponent
+    mitigation_score: MitigationComponent
+    controversy_score: ControversyComponent
+
+
+class ScoreTrace(BaseModel):
+    final_score: float
+    components: ScoreComponents
+    formula_display: str
+    confidence_score: float
+    confidence_factors: dict
 
 
 class MaterialRisk(BaseModel):
@@ -124,14 +184,15 @@ class AnalyzeResponse(BaseModel):
     materials: list[MaterialRisk]
     opacity_audit: OpacityAudit
     ethic_score: EthicScoreResult
+    score_trace: ScoreTrace
     ai_summary: str
+    natural_language_explanation: str
     alternatives: list[Alternative]
 
 
-# ── Open Food Facts ──────────────────────────────────────────────────
+# -- Open Food Facts --------------------------------------------------------
 
 async def lookup_barcode(barcode: str) -> dict | None:
-    """Look up a product on Open Food Facts by barcode."""
     url = f"{OFF_BASE}/api/v2/product/{barcode}.json"
     params = {
         "fields": "product_name,brands,categories,ingredients_text,ingredients_text_en,"
@@ -149,7 +210,6 @@ async def lookup_barcode(barcode: str) -> dict | None:
 
 
 async def search_products(query: str, page_size: int = 10) -> list[dict]:
-    """Search Open Food Facts by product name."""
     url = f"{OFF_BASE}/cgi/search.pl"
     params = {
         "search_terms": query,
@@ -168,10 +228,9 @@ async def search_products(query: str, page_size: int = 10) -> list[dict]:
         return []
 
 
-# ── Claude AI ────────────────────────────────────────────────────────
+# -- Claude AI ---------------------------------------------------------------
 
 def ai_decompose_materials(product_name: str, brand: str, ingredients: str, category: str) -> list[str]:
-    """Use Claude to decompose a product into raw materials for ILAB risk analysis."""
     if not claude:
         return _fallback_decompose(ingredients)
 
@@ -195,7 +254,12 @@ Output ONLY the JSON array, no explanation."""
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
-        # Parse JSON array from response
+        # Strip markdown code fences if present
+        if "```" in text:
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
         if text.startswith("["):
             materials = json.loads(text)
             return [m.lower().strip() for m in materials if isinstance(m, str)]
@@ -206,7 +270,6 @@ Output ONLY the JSON array, no explanation."""
 
 
 def _fallback_decompose(ingredients: str) -> list[str]:
-    """Simple keyword-based decomposition when Claude is unavailable."""
     if not ingredients:
         return []
     known = [
@@ -219,8 +282,8 @@ def _fallback_decompose(ingredients: str) -> list[str]:
     return [m for m in known if m in ingredients_lower]
 
 
-def ai_opacity_audit(product_name: str, brand: str, labels: list[str], category: str) -> OpacityAudit:
-    """Use Claude to audit brand transparency and detect greenwashing."""
+def ai_opacity_audit(product_name: str, brand: str, labels: list[str], category: str) -> dict:
+    """Use Claude to audit brand transparency. Returns dict with all mitigation fields."""
     if not claude:
         return _fallback_opacity(labels)
 
@@ -239,58 +302,70 @@ Evaluate on these criteria:
 2. Are there third-party certifications (Fair Trade, B Corp, Rainforest Alliance, etc.)?
 3. Is there evidence of vague sustainability claims without data ("eco-friendly", "green", "conscious")?
 4. Does the brand provide specific, measurable sustainability targets?
+5. Does the brand publish an ESG / sustainability report?
+6. Does the brand have supply chain traceability systems?
 
 Return ONLY valid JSON in this exact format:
 {{
   "transparency_score": <0-100 number, higher = more transparent>,
-  "flags": [<list of 1-4 short string flags like "No public supplier list", "Vague eco-claims", "Third-party certified">],
-  "summary": "<1-2 sentence summary of the brand's transparency posture>"
+  "flags": [<list of 1-4 short string flags>],
+  "summary": "<1-2 sentence summary>",
+  "has_supplier_list": <true/false>,
+  "has_certifications": <true/false>,
+  "has_esg_report": <true/false>,
+  "has_traceability": <true/false>
 }}"""
 
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=400,
+            max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
-        # Find JSON in response
         start = text.find("{")
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
             data = json.loads(text[start:end])
-            return OpacityAudit(
-                transparency_score=float(data.get("transparency_score", 50)),
-                flags=data.get("flags", []),
-                summary=data.get("summary", "Analysis unavailable."),
-            )
+            return {
+                "transparency_score": float(data.get("transparency_score", 50)),
+                "flags": data.get("flags", []),
+                "summary": data.get("summary", "Analysis unavailable."),
+                "has_supplier_list": bool(data.get("has_supplier_list", False)),
+                "has_certifications": bool(data.get("has_certifications", False)),
+                "has_esg_report": bool(data.get("has_esg_report", False)),
+                "has_traceability": bool(data.get("has_traceability", False)),
+            }
     except Exception as e:
         print(f"Claude opacity audit error: {e}")
 
     return _fallback_opacity(labels)
 
 
-def _fallback_opacity(labels: list[str]) -> OpacityAudit:
-    """Fallback opacity scoring based on labels alone."""
+def _fallback_opacity(labels: list[str]) -> dict:
     good_labels = {"en:fair-trade", "en:organic", "en:rainforest-alliance",
                    "en:utz-certified", "en:b-corporation"}
     found = set(labels or []) & good_labels
     score = min(30 + len(found) * 15, 85)
     flags = []
+    has_certs = len(found) > 0
     if not found:
         flags.append("No recognized ethical certifications")
     else:
         flags.append(f"{len(found)} ethical certification(s) found")
-    return OpacityAudit(
-        transparency_score=score,
-        flags=flags,
-        summary="Automated label-based assessment. Full AI audit requires API key.",
-    )
+    return {
+        "transparency_score": score,
+        "flags": flags,
+        "summary": "Automated label-based assessment. Full AI audit requires API key.",
+        "has_supplier_list": False,
+        "has_certifications": has_certs,
+        "has_esg_report": False,
+        "has_traceability": False,
+    }
 
 
 def ai_generate_summary(product_name: str, brand: str, ethic_score: float,
-                         materials: list[MaterialRisk], opacity: OpacityAudit) -> str:
-    """Generate a consumer-friendly summary of the analysis."""
+                         materials: list[MaterialRisk], opacity_data: dict) -> str:
     if not claude:
         return _fallback_summary(product_name, brand, ethic_score)
 
@@ -301,8 +376,8 @@ Be direct but not alarmist. Use specific facts.
 Product: {product_name} by {brand}
 EthicScore: {ethic_score}/100
 High-risk materials: {', '.join(high_risk) if high_risk else 'None identified'}
-Brand transparency: {opacity.summary}
-Transparency flags: {', '.join(opacity.flags)}
+Brand transparency: {opacity_data.get('summary', 'N/A')}
+Transparency flags: {', '.join(opacity_data.get('flags', []))}
 
 Write ONLY the summary paragraph, no labels or formatting."""
 
@@ -329,26 +404,32 @@ def _fallback_summary(product_name: str, brand: str, score: float) -> str:
 
 
 def ai_suggest_alternatives(product_name: str, brand: str, category: str, score: float) -> list[Alternative]:
-    """Use Claude to suggest more ethical alternatives."""
+    """Suggest genuinely more ethical alternatives with realistic scores."""
     if not claude:
         return []
 
-    prompt = f"""You are an ethical consumer advisor. A user just analyzed "{product_name}" by {brand}
-(category: {category}) which scored {score}/100 on ethical sourcing.
+    prompt = f"""You are an ethical consumer advisor. A user analyzed "{product_name}" by {brand}
+(category: {category}) which scored {score:.0f}/100 on ethical sourcing.
 
-Suggest 3 more ethically sourced alternatives in the same product category.
-Focus on brands known for Fair Trade, organic, B Corp certification, or transparent supply chains.
+Suggest 3 genuinely more ethically sourced alternatives in the same product category.
+IMPORTANT: Only suggest brands that are ACTUALLY known for ethical practices. These must be real products/brands.
+Focus on brands with verified Fair Trade, organic, B Corp, or transparent supply chains.
+
+The estimated scores should reflect genuine ethical standing:
+- 85-95: Truly exemplary (B Corp certified, fully transparent supply chain, Fair Trade)
+- 75-84: Very good (multiple certifications, public sustainability reports)
+- 65-74: Good (some certifications, decent transparency)
 
 Return ONLY a JSON array:
 [
-  {{"name": "<product>", "brand": "<brand>", "reason": "<1 sentence why it's better>", "estimated_score": <70-95>}},
+  {{"name": "<specific real product>", "brand": "<real brand>", "reason": "<1 sentence why it's specifically better>", "estimated_score": <65-95>}},
   ...
 ]"""
 
     try:
         response = claude.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=400,
+            max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
         text = response.content[0].text.strip()
@@ -362,27 +443,82 @@ Return ONLY a JSON array:
     return []
 
 
-# ── News Fetching ────────────────────────────────────────────────────
+def ai_generate_natural_explanation(
+    product_name: str, brand: str, final_score: float,
+    supply_chain_risk: float, mitigation_value: float, controversy_value: float,
+    materials: list[MaterialRisk], opacity_data: dict
+) -> str:
+    """Generate a human-readable explanation of the score."""
+    if not claude:
+        return _fallback_natural_explanation(product_name, brand, final_score, supply_chain_risk, mitigation_value)
 
-async def fetch_news_rss(search_query: str, count: int = 10) -> list[dict]:
-    """Fetch news from Google News RSS feed."""
+    high_risk_mats = [m.material for m in materials if m.risk_score >= 50]
+    mitigation_factors = []
+    if opacity_data.get("has_supplier_list"):
+        mitigation_factors.append("supplier transparency")
+    if opacity_data.get("has_certifications"):
+        mitigation_factors.append("third-party certifications")
+    if opacity_data.get("has_esg_report"):
+        mitigation_factors.append("ESG reporting")
+    if opacity_data.get("has_traceability"):
+        mitigation_factors.append("supply chain traceability")
+
+    prompt = f"""Write a 2-3 sentence plain English explanation of this product's ethical risk score.
+Explain WHY it got this score, referencing specific materials and mitigating factors.
+Be factual and specific.
+
+Product: {product_name} by {brand}
+Final Score: {final_score}/100 (higher = more ethical, lower = riskier)
+Supply Chain Risk: {supply_chain_risk:.2f} (0-1 scale, higher = riskier)
+High-risk materials: {', '.join(high_risk_mats) if high_risk_mats else 'None'}
+Mitigation factors present: {', '.join(mitigation_factors) if mitigation_factors else 'None identified'}
+Controversy score: {controversy_value:.2f}
+
+Write ONLY the explanation, no formatting."""
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        print(f"Claude explanation error: {e}")
+
+    return _fallback_natural_explanation(product_name, brand, final_score, supply_chain_risk, mitigation_value)
+
+
+def _fallback_natural_explanation(product_name, brand, score, scr, mit):
+    if score >= 75:
+        return f"This product has lower risk due to responsible sourcing practices and strong mitigation measures by {brand}."
+    elif score >= 50:
+        return f"This product has moderate risk. While {brand} implements some transparency measures, certain materials in the supply chain carry labor or environmental concerns."
+    else:
+        return f"This product has higher risk due to materials sourced from regions with known labor concerns. {brand} could improve by increasing supply chain transparency and obtaining third-party certifications."
+
+
+# -- News Fetching -----------------------------------------------------------
+
+async def fetch_news_rss(search_query: str, count: int = 25) -> list[dict]:
+    """Fetch news from Google News RSS feed. Prefer recent articles."""
     cache_key = f"{search_query}:{count}"
     now = time.time()
 
-    # Check cache
     if cache_key in NEWS_CACHE:
         cached_time, cached_articles = NEWS_CACHE[cache_key]
         if now - cached_time < NEWS_CACHE_TTL:
             return cached_articles[:count]
 
-    url = f"https://news.google.com/rss/search?q={quote_plus(search_query)}&hl=en-US&gl=US&ceid=US:en"
+    # Add "when:7d" to Google News query to get articles from last 7 days
+    fresh_query = f"{search_query} when:7d"
+    url = f"https://news.google.com/rss/search?q={quote_plus(fresh_query)}&hl=en-US&gl=US&ceid=US:en"
     try:
         resp = await http.get(url, headers={"User-Agent": "EthicLensAI/1.0"})
         feed = feedparser.parse(resp.text)
 
         articles = []
         for entry in feed.entries[:count]:
-            # Extract source from title (Google News format: "Title - Source")
             title = entry.get("title", "")
             source = ""
             if " - " in title:
@@ -390,15 +526,12 @@ async def fetch_news_rss(search_query: str, count: int = 10) -> list[dict]:
                 title = parts[0]
                 source = parts[1]
 
-            # Parse publish date
             published = entry.get("published", "")
 
-            # Try to get image from description
             desc = entry.get("description", "")
             img_match = re.search(r'src="([^"]+)"', desc)
             image_url = img_match.group(1) if img_match else None
 
-            # Clean description of HTML
             clean_desc = re.sub(r'<[^>]+>', '', desc).strip()
 
             articles.append({
@@ -410,6 +543,38 @@ async def fetch_news_rss(search_query: str, count: int = 10) -> list[dict]:
                 "image_url": image_url,
             })
 
+        # If we got fewer than count from 7d, also fetch without time filter
+        if len(articles) < count:
+            url2 = f"https://news.google.com/rss/search?q={quote_plus(search_query)}&hl=en-US&gl=US&ceid=US:en"
+            resp2 = await http.get(url2, headers={"User-Agent": "EthicLensAI/1.0"})
+            feed2 = feedparser.parse(resp2.text)
+            seen_links = {a["link"] for a in articles}
+            for entry in feed2.entries:
+                if len(articles) >= count:
+                    break
+                link = entry.get("link", "")
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+                title = entry.get("title", "")
+                source = ""
+                if " - " in title:
+                    parts = title.rsplit(" - ", 1)
+                    title = parts[0]
+                    source = parts[1]
+                desc = entry.get("description", "")
+                img_match = re.search(r'src="([^"]+)"', desc)
+                image_url = img_match.group(1) if img_match else None
+                clean_desc = re.sub(r'<[^>]+>', '', desc).strip()
+                articles.append({
+                    "title": title,
+                    "link": link,
+                    "source": source,
+                    "published": entry.get("published", ""),
+                    "snippet": clean_desc[:200] if clean_desc else "",
+                    "image_url": image_url,
+                })
+
         NEWS_CACHE[cache_key] = (now, articles)
         return articles
     except Exception as e:
@@ -418,21 +583,18 @@ async def fetch_news_rss(search_query: str, count: int = 10) -> list[dict]:
 
 
 async def summarize_article(url: str) -> dict:
-    """Fetch an article and generate an AI summary."""
     if not claude:
         return {"summary": "AI summary unavailable.", "key_points": [], "source_url": url}
 
-    # Fetch article content
     article_text = ""
     try:
         resp = await http.get(url, follow_redirects=True, timeout=10)
         html = resp.text
-        # Simple HTML text extraction
         text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
         text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
         text = re.sub(r'<[^>]+>', ' ', text)
         text = re.sub(r'\s+', ' ', text).strip()
-        article_text = text[:3000]  # Limit to avoid token overflow
+        article_text = text[:3000]
     except Exception:
         article_text = ""
 
@@ -477,86 +639,222 @@ Return ONLY valid JSON:
     return {"summary": "Summary generation failed.", "key_points": [], "source_url": url}
 
 
-# ── Scoring Engine ───────────────────────────────────────────────────
+# -- Transparent Scoring Engine -----------------------------------------------
 
-def compute_ethic_score(
+def compute_ethic_score_with_trace(
     material_risks: list[MaterialRisk],
-    opacity: OpacityAudit,
-) -> EthicScoreResult:
-    """Compute the weighted EthicScore.
+    opacity_data: dict,
+) -> tuple[EthicScoreResult, ScoreTrace]:
+    """Compute EthicScore with FULL calculation transparency.
 
-    Weights:
-      40% — Material Risk Index (inverted: lower risk = higher score)
-      30% — Brand Disclosure Score (from opacity audit)
-      20% — News Sentiment (placeholder — defaults to 60/100)
-      10% — Community Verification (placeholder — defaults to 50/100)
+    The scoring follows this formula:
+      supply_chain_risk = weighted average of material risks (0-1, higher = riskier)
+      mitigation_score  = based on brand transparency factors (0-1, higher = more mitigated)
+      controversy_score = placeholder for real-time controversy (0-1)
+
+      Final Risk = (supply_chain_risk * (1 - mitigation_score)) + controversy_score
+      Final Score = (1 - Final Risk) * 100
     """
-    # Material Risk Index: average risk of all materials, inverted to score
-    if material_risks:
-        known = [m for m in material_risks if m.commodity is not None]
-        if known:
-            avg_risk = sum(m.risk_score for m in known) / len(known)
-        else:
-            avg_risk = 30  # Unknown materials get moderate baseline risk
-        material_score = max(0, 100 - avg_risk)
+
+    # -- Step 1: Material weights and risks --
+    num_materials = len(material_risks)
+    known_materials = [m for m in material_risks if m.commodity is not None]
+    num_known = len(known_materials)
+
+    material_details = []
+    total_supply_chain_risk = 0.0
+
+    if num_known > 0:
+        # Equal weighting across known materials
+        material_weight = 1.0 / num_known
+
+        for m in known_materials:
+            # Material risk on 0-1 scale
+            mat_risk_value = m.risk_score / 100.0
+
+            # DOL listed?
+            dol_listed = m.commodity is not None and m.commodity in ILAB_RISK_DB
+
+            # ILO sector score: based on severity and breadth
+            max_sev = max((c.get("severity", 1) for c in m.countries), default=1) if m.countries else 0
+            ilo_sector_score = max_sev / 3.0  # normalize to 0-1
+
+            # Country risk: weighted average of country severities
+            country_details = []
+            if m.countries:
+                country_weight = 1.0 / len(m.countries)
+                country_risk_total = 0.0
+                for c in m.countries:
+                    base_score = c.get("severity", 1) / 3.0
+                    # iLab adjustment: extra penalty for dual CL+FL
+                    risk_types = c.get("risk_types", [])
+                    ilab_adj = 0.15 if ("CL" in risk_types and "FL" in risk_types) else 0.0
+                    final_c_score = min(base_score + ilab_adj, 1.0)
+                    country_risk_total += final_c_score * country_weight
+
+                    country_details.append({
+                        "name": c.get("name", "Unknown"),
+                        "weight": round(country_weight, 4),
+                        "base_score": round(base_score, 4),
+                        "ilab_adjustment": round(ilab_adj, 4),
+                        "final_score": round(final_c_score, 4),
+                        "risk_types": risk_types,
+                        "severity": c.get("severity", 1),
+                    })
+                country_risk_value = country_risk_total
+            else:
+                country_risk_value = 0.3  # default moderate for unknown
+
+            # Stage weight (all raw material stage for now)
+            stage_weight = 1.0
+
+            # Contribution to total
+            contribution = material_weight * mat_risk_value * stage_weight
+            total_supply_chain_risk += contribution
+
+            material_details.append(MaterialRiskDetail(
+                name=m.material,
+                material_weight=round(material_weight, 4),
+                material_risk={
+                    "value": round(mat_risk_value, 4),
+                    "breakdown": {
+                        "dol_score": 1.0 if dol_listed else 0.0,
+                        "ilo_sector_score": round(ilo_sector_score, 4),
+                    },
+                },
+                country_risk={
+                    "value": round(country_risk_value, 4),
+                    "countries": country_details,
+                },
+                stage_weight=stage_weight,
+                contribution=round(contribution, 4),
+            ))
     else:
-        material_score = 50  # No data = uncertain
+        # No known materials — moderate uncertainty
+        total_supply_chain_risk = 0.4
 
-    brand_score = opacity.transparency_score
+    supply_chain_risk = min(total_supply_chain_risk, 1.0)
 
-    # Placeholders — these could integrate real news API / community data later
-    news_score = 60.0
-    community_score = 50.0
+    # -- Step 2: Mitigation score --
+    has_supplier = opacity_data.get("has_supplier_list", False)
+    has_certs = opacity_data.get("has_certifications", False)
+    has_esg = opacity_data.get("has_esg_report", False)
+    has_trace = opacity_data.get("has_traceability", False)
 
-    overall = (
-        material_score * 0.40
-        + brand_score * 0.30
-        + news_score * 0.20
-        + community_score * 0.10
+    mitigation_factors = MitigationFactors(
+        supplier_list=has_supplier,
+        certifications=has_certs,
+        esg_report=has_esg,
+        traceability=has_trace,
     )
-    overall = round(overall, 1)
 
-    if overall >= 75:
+    # Each factor contributes 0.25 to mitigation (max 1.0)
+    mitigation_value = sum([
+        0.25 if has_supplier else 0,
+        0.25 if has_certs else 0,
+        0.25 if has_esg else 0,
+        0.25 if has_trace else 0,
+    ])
+
+    # -- Step 3: Controversy score (placeholder — 0.1 baseline) --
+    controversy_value = 0.1
+    controversy_articles = 0  # Would be populated from real-time news API
+
+    # -- Step 4: Final score calculation --
+    # Final Risk = (supply_chain_risk * (1 - mitigation)) + controversy
+    final_risk = (supply_chain_risk * (1 - mitigation_value)) + controversy_value
+    final_risk = min(max(final_risk, 0), 1.0)
+
+    # Convert to 0-100 score (higher = more ethical)
+    final_score = round((1 - final_risk) * 100, 1)
+
+    # Build formula display string
+    formula_display = (
+        f"Final Risk = ({supply_chain_risk:.4f} x (1 - {mitigation_value:.2f})) + {controversy_value:.2f} "
+        f"= {final_risk:.4f} -> Score = {final_score}/100"
+    )
+
+    # -- Step 5: Confidence score --
+    conf_ingredients = min(num_known / max(num_materials, 1), 1.0) if num_materials > 0 else 0.3
+    conf_country = 1.0 if any(m.countries for m in material_risks) else 0.3
+    conf_company = sum([
+        0.25 if has_supplier else 0,
+        0.25 if has_certs else 0,
+        0.25 if has_esg else 0,
+        0.25 if has_trace else 0,
+    ])
+    confidence_score = round((conf_ingredients * 0.4 + conf_country * 0.3 + conf_company * 0.3), 2)
+
+    # -- Badge --
+    if final_score >= 75:
         badge = "VERIFIED GREEN"
         badge_color = "bg-emerald-500"
-    elif overall >= 50:
+    elif final_score >= 50:
         badge = "MODERATE RISK"
         badge_color = "bg-amber-500"
-    elif overall >= 25:
+    elif final_score >= 25:
         badge = "HIGH RISK"
         badge_color = "bg-red-500"
     else:
         badge = "UNVERIFIED"
         badge_color = "bg-gray-400"
 
-    return EthicScoreResult(
-        overall_score=overall,
+    # Build old-style EthicScoreResult for backward compat
+    material_score = max(0, 100 - supply_chain_risk * 100)
+    brand_score = opacity_data.get("transparency_score", 50)
+    news_score = max(0, (1 - controversy_value) * 100)
+
+    ethic_result = EthicScoreResult(
+        overall_score=final_score,
         badge=badge,
         badge_color=badge_color,
         material_risk_index=round(material_score, 1),
         brand_disclosure_score=round(brand_score, 1),
         news_sentiment_score=round(news_score, 1),
-        community_score=round(community_score, 1),
+        community_score=round(mitigation_value * 100, 1),
     )
 
+    score_trace = ScoreTrace(
+        final_score=final_score,
+        components=ScoreComponents(
+            supply_chain_risk=SupplyChainComponent(
+                value=round(supply_chain_risk, 4),
+                materials=material_details,
+            ),
+            mitigation_score=MitigationComponent(
+                value=round(mitigation_value, 4),
+                factors=mitigation_factors,
+            ),
+            controversy_score=ControversyComponent(
+                value=round(controversy_value, 4),
+                article_count=controversy_articles,
+            ),
+        ),
+        formula_display=formula_display,
+        confidence_score=confidence_score,
+        confidence_factors={
+            "known_ingredients": round(conf_ingredients, 2),
+            "country_data_available": round(conf_country, 2),
+            "company_data_available": round(conf_company, 2),
+        },
+    )
 
-# ── Endpoints ────────────────────────────────────────────────────────
+    return ethic_result, score_trace
+
+
+# -- Endpoints ---------------------------------------------------------------
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
         "claude_available": claude is not None,
-        "version": "1.0.0",
+        "version": "2.0.0",
     }
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest):
-    """Analyze a product's ethical sourcing by barcode or name.
-
-    Supply either `barcode` (EAN/UPC) or `product_name` (+ optional `brand`).
-    """
     if not req.barcode and not req.product_name:
         raise HTTPException(400, "Provide either 'barcode' or 'product_name'")
 
@@ -597,18 +895,27 @@ async def analyze(req: AnalyzeRequest):
         MaterialRisk(**get_material_risk(m)) for m in raw_materials
     ]
 
-    # 4. AI Opacity Audit
-    opacity = ai_opacity_audit(product_name, brand, labels, category)
+    # 4. AI Opacity Audit (returns dict with mitigation fields)
+    opacity_data = ai_opacity_audit(product_name, brand, labels, category)
 
-    # 5. Compute EthicScore
-    ethic_score = compute_ethic_score(material_risks, opacity)
+    # 5. Compute EthicScore WITH full trace
+    ethic_score, score_trace = compute_ethic_score_with_trace(material_risks, opacity_data)
 
     # 6. Generate consumer summary
     summary = ai_generate_summary(
-        product_name, brand, ethic_score.overall_score, material_risks, opacity
+        product_name, brand, ethic_score.overall_score, material_risks, opacity_data
     )
 
-    # 7. Suggest ethical alternatives
+    # 7. Generate natural language explanation
+    natural_explanation = ai_generate_natural_explanation(
+        product_name, brand, ethic_score.overall_score,
+        score_trace.components.supply_chain_risk.value,
+        score_trace.components.mitigation_score.value,
+        score_trace.components.controversy_score.value,
+        material_risks, opacity_data,
+    )
+
+    # 8. Suggest ethical alternatives
     alternatives = ai_suggest_alternatives(
         product_name, brand, category, ethic_score.overall_score
     )
@@ -618,6 +925,13 @@ async def analyze(req: AnalyzeRequest):
     if ingredients_text:
         ingredients_list = [i.strip() for i in ingredients_text.split(",") if i.strip()]
 
+    # Build opacity audit model for response
+    opacity_model = OpacityAudit(
+        transparency_score=opacity_data["transparency_score"],
+        flags=opacity_data["flags"],
+        summary=opacity_data["summary"],
+    )
+
     return AnalyzeResponse(
         product_name=product_name,
         brand=brand,
@@ -625,16 +939,17 @@ async def analyze(req: AnalyzeRequest):
         image_url=image_url,
         ingredients=ingredients_list[:20],
         materials=material_risks,
-        opacity_audit=opacity,
+        opacity_audit=opacity_model,
         ethic_score=ethic_score,
+        score_trace=score_trace,
         ai_summary=summary,
+        natural_language_explanation=natural_explanation,
         alternatives=alternatives,
     )
 
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1, le=50)):
-    """Search for products by name."""
     products = await search_products(q, page_size=limit)
 
     results = []
@@ -653,20 +968,13 @@ async def search(q: str = Query(..., min_length=1), limit: int = Query(10, ge=1,
 
 @app.post("/identify-image")
 async def identify_image(req: IdentifyImageRequest):
-    """Identify a product from a photo using Claude Vision.
-
-    Accepts a base64-encoded image. Returns the identified product name,
-    brand, and category so the frontend can proceed to /analyze.
-    """
     if not claude:
         raise HTTPException(503, "AI image recognition requires Claude API key")
 
-    # Strip data URI prefix if present (e.g. "data:image/jpeg;base64,...")
     image_data = req.image
     if "," in image_data:
         image_data = image_data.split(",", 1)[1]
 
-    # Determine media type
     media_type = req.media_type
     if req.image.startswith("data:"):
         media_type = req.image.split(";")[0].split(":")[1]
@@ -722,9 +1030,8 @@ Output ONLY the JSON, nothing else.""",
 @app.get("/news")
 async def get_news(
     category: str = Query("all", description="Category: all, food, fashion, beauty, tech, home, kids"),
-    limit: int = Query(10, ge=1, le=20),
+    limit: int = Query(25, ge=1, le=50),
 ):
-    """Fetch real-time sustainability/ethical sourcing news."""
     search_query = NEWS_QUERIES.get(category.lower(), NEWS_QUERIES["all"])
     articles = await fetch_news_rss(search_query, count=limit)
     return {"category": category, "count": len(articles), "articles": articles}
@@ -732,7 +1039,6 @@ async def get_news(
 
 @app.get("/news/summary")
 async def get_article_summary(url: str = Query(..., description="Article URL to summarize")):
-    """Generate an AI summary of a news article."""
     result = await summarize_article(url)
     return result
 
@@ -741,10 +1047,8 @@ async def get_article_summary(url: str = Query(..., description="Article URL to 
 async def get_personalized_news(
     materials: str = Query("", description="Comma-separated materials from scan history"),
     categories: str = Query("", description="Comma-separated product categories"),
-    limit: int = Query(10, ge=1, le=20),
+    limit: int = Query(25, ge=1, le=50),
 ):
-    """Fetch personalized news based on user's scan history."""
-    # Build a personalized query from user's interests
     terms = []
     if materials:
         mat_list = [m.strip() for m in materials.split(",") if m.strip()]
@@ -754,7 +1058,6 @@ async def get_personalized_news(
         terms.extend(cat_list[:3])
 
     if not terms:
-        # Fall back to general ethical sourcing news
         search_query = NEWS_QUERIES["all"]
     else:
         search_query = " ".join(terms) + " ethical sourcing sustainability"

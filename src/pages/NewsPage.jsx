@@ -6,7 +6,8 @@ import { useAuth } from '../contexts/AuthContext'
 import { getUserScanProfile } from '../lib/firestore'
 
 const categories = [
-  { id: 'all', label: 'For You', emoji: '\u2728' },
+  { id: 'all', label: 'All', emoji: '\uD83C\uDF0D' },
+  { id: 'foryou', label: 'For You', emoji: '\u2728' },
   { id: 'food', label: 'Food', emoji: '\uD83C\uDF6B' },
   { id: 'fashion', label: 'Fashion', emoji: '\uD83D\uDC57' },
   { id: 'beauty', label: 'Beauty', emoji: '\uD83E\uDDF4' },
@@ -227,7 +228,7 @@ export default function NewsPage() {
     try {
       let data
 
-      if (activeCategory === 'all') {
+      if (activeCategory === 'foryou') {
         // "For You" — requires auth
         if (!user) {
           setArticles([])
@@ -236,13 +237,12 @@ export default function NewsPage() {
         }
         const profile = await getUserScanProfile(user.uid)
         if (profile.materials.length || profile.categories.length) {
-          data = await fetchForYouNews(profile.materials, profile.categories)
+          data = await fetchForYouNews(profile.materials, profile.categories, 25)
         } else {
-          // No scan history yet, fall back to general news
-          data = await fetchNews('all')
+          data = await fetchNews('all', 25)
         }
       } else {
-        data = await fetchNews(activeCategory)
+        data = await fetchNews(activeCategory, 25)
       }
 
       setArticles(data.articles ?? data ?? [])
@@ -286,7 +286,7 @@ export default function NewsPage() {
   }
 
   /* ---- show sign-in prompt for "For You" when logged out ---- */
-  const showSignIn = activeCategory === 'all' && !user && !loading
+  const showSignIn = activeCategory === 'foryou' && !user && !loading
 
   return (
     <div className="min-h-dvh">
