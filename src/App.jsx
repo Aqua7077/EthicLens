@@ -4,10 +4,11 @@ import HomePage from './pages/HomePage'
 import NewsPage from './pages/NewsPage'
 import AboutPage from './pages/AboutPage'
 import ResultPage from './pages/ResultPage'
+import ArticlePage from './pages/ArticlePage'
 
 function App() {
   const location = useLocation()
-  const hideNav = location.pathname.startsWith('/result')
+  const hideNav = location.pathname.startsWith('/result') || location.pathname.startsWith('/news/article')
 
   return (
     <div className="flex flex-col min-h-dvh bg-white">
@@ -15,6 +16,7 @@ function App() {
         <Routes>
           <Route path="/" element={<HomePage />} />
           <Route path="/news" element={<NewsPage />} />
+          <Route path="/news/article" element={<ArticlePage />} />
           <Route path="/about" element={<AboutPage />} />
           <Route path="/result" element={<ResultPage />} />
         </Routes>

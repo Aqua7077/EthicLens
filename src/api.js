@@ -7,8 +7,6 @@ const API_BASE = import.meta.env.VITE_API_URL || 'https://ethiclens-api.onrender
 
 /**
  * Analyze a product by barcode or name.
- * @param {{ barcode?: string, product_name?: string, brand?: string }} params
- * @returns {Promise<object>} Full analysis result
  */
 export async function analyzeProduct({ barcode, product_name, brand } = {}) {
   const resp = await fetch(`${API_BASE}/analyze`, {
@@ -25,9 +23,6 @@ export async function analyzeProduct({ barcode, product_name, brand } = {}) {
 
 /**
  * Search products by name.
- * @param {string} query
- * @param {number} limit
- * @returns {Promise<{ query: string, count: number, products: object[] }>}
  */
 export async function searchProducts(query, limit = 10) {
   const params = new URLSearchParams({ q: query, limit: String(limit) })
@@ -38,9 +33,6 @@ export async function searchProducts(query, limit = 10) {
 
 /**
  * Identify a product from a photo using Claude Vision.
- * @param {string} base64Image - base64-encoded image (with or without data URI prefix)
- * @param {string} mediaType - image/jpeg, image/png, etc.
- * @returns {Promise<{ product_name: string, brand: string, category: string }>}
  */
 export async function identifyImage(base64Image, mediaType = 'image/jpeg') {
   const resp = await fetch(`${API_BASE}/identify-image`, {
@@ -52,6 +44,40 @@ export async function identifyImage(base64Image, mediaType = 'image/jpeg') {
     const err = await resp.json().catch(() => ({}))
     throw new Error(err.detail || `Image recognition failed (${resp.status})`)
   }
+  return resp.json()
+}
+
+/**
+ * Fetch real-time news by category.
+ */
+export async function fetchNews(category = 'all', limit = 10) {
+  const params = new URLSearchParams({ category, limit: String(limit) })
+  const resp = await fetch(`${API_BASE}/news?${params}`)
+  if (!resp.ok) throw new Error(`News fetch failed (${resp.status})`)
+  return resp.json()
+}
+
+/**
+ * Fetch personalized "For You" news based on scan history.
+ */
+export async function fetchForYouNews(materials = [], categories = [], limit = 10) {
+  const params = new URLSearchParams({
+    materials: materials.join(','),
+    categories: categories.join(','),
+    limit: String(limit),
+  })
+  const resp = await fetch(`${API_BASE}/news/for-you?${params}`)
+  if (!resp.ok) throw new Error(`Personalized news failed (${resp.status})`)
+  return resp.json()
+}
+
+/**
+ * Get AI summary of a news article.
+ */
+export async function fetchArticleSummary(url) {
+  const params = new URLSearchParams({ url })
+  const resp = await fetch(`${API_BASE}/news/summary?${params}`)
+  if (!resp.ok) throw new Error(`Article summary failed (${resp.status})`)
   return resp.json()
 }
 

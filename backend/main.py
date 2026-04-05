@@ -4,15 +4,22 @@ Endpoints:
   POST /analyze         — Analyze a product by barcode or name
   POST /identify-image  — Identify a product from a photo using Claude Vision
   GET  /search          — Search products by name
+  GET  /news            — Fetch real-time sustainability news
+  GET  /news/summary    — AI-summarize an article
+  GET  /news/for-you    — Personalized news based on scan history
   GET  /health          — Health check
 """
 
 import os
 import json
+import time
 import base64
+import re
 from pathlib import Path
+from urllib.parse import quote_plus
 import httpx
 import anthropic
+import feedparser
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -45,6 +52,21 @@ OFF_HEADERS = {"User-Agent": "EthicLensAI/1.0 (ethiclens-appathon@mit.edu)"}
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 http = httpx.AsyncClient(timeout=15, headers=OFF_HEADERS)
+
+# ── News Cache & Config ──────────────────────────────────────────────
+
+NEWS_CACHE: dict[str, tuple[float, list]] = {}  # key -> (timestamp, articles)
+NEWS_CACHE_TTL = 1800  # 30 minutes
+
+NEWS_QUERIES: dict[str, str] = {
+    "all": "ethical sourcing supply chain transparency",
+    "food": "ethical food sourcing child labor cocoa palm oil",
+    "fashion": "sustainable fashion garment labor rights",
+    "beauty": "beauty cosmetics sustainability ethical sourcing",
+    "tech": "electronics supply chain cobalt mining labor",
+    "home": "sustainable home products timber deforestation",
+    "kids": "children products safety ethical manufacturing",
+}
 
 
 # ── Models ───────────────────────────────────────────────────────────
@@ -86,6 +108,13 @@ class EthicScoreResult(BaseModel):
     community_score: float
 
 
+class Alternative(BaseModel):
+    name: str
+    brand: str
+    reason: str
+    estimated_score: int
+
+
 class AnalyzeResponse(BaseModel):
     product_name: str
     brand: str
@@ -96,6 +125,7 @@ class AnalyzeResponse(BaseModel):
     opacity_audit: OpacityAudit
     ethic_score: EthicScoreResult
     ai_summary: str
+    alternatives: list[Alternative]
 
 
 # ── Open Food Facts ──────────────────────────────────────────────────
@@ -298,6 +328,155 @@ def _fallback_summary(product_name: str, brand: str, score: float) -> str:
         return f"{product_name} by {brand} raises ethical sourcing concerns. Limited supply chain transparency and potential labor risks were identified."
 
 
+def ai_suggest_alternatives(product_name: str, brand: str, category: str, score: float) -> list[Alternative]:
+    """Use Claude to suggest more ethical alternatives."""
+    if not claude:
+        return []
+
+    prompt = f"""You are an ethical consumer advisor. A user just analyzed "{product_name}" by {brand}
+(category: {category}) which scored {score}/100 on ethical sourcing.
+
+Suggest 3 more ethically sourced alternatives in the same product category.
+Focus on brands known for Fair Trade, organic, B Corp certification, or transparent supply chains.
+
+Return ONLY a JSON array:
+[
+  {{"name": "<product>", "brand": "<brand>", "reason": "<1 sentence why it's better>", "estimated_score": <70-95>}},
+  ...
+]"""
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        start = text.find("[")
+        end = text.rfind("]") + 1
+        if start >= 0 and end > start:
+            items = json.loads(text[start:end])
+            return [Alternative(**item) for item in items[:4]]
+    except Exception as e:
+        print(f"Claude alternatives error: {e}")
+    return []
+
+
+# ── News Fetching ────────────────────────────────────────────────────
+
+async def fetch_news_rss(search_query: str, count: int = 10) -> list[dict]:
+    """Fetch news from Google News RSS feed."""
+    cache_key = f"{search_query}:{count}"
+    now = time.time()
+
+    # Check cache
+    if cache_key in NEWS_CACHE:
+        cached_time, cached_articles = NEWS_CACHE[cache_key]
+        if now - cached_time < NEWS_CACHE_TTL:
+            return cached_articles[:count]
+
+    url = f"https://news.google.com/rss/search?q={quote_plus(search_query)}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        resp = await http.get(url, headers={"User-Agent": "EthicLensAI/1.0"})
+        feed = feedparser.parse(resp.text)
+
+        articles = []
+        for entry in feed.entries[:count]:
+            # Extract source from title (Google News format: "Title - Source")
+            title = entry.get("title", "")
+            source = ""
+            if " - " in title:
+                parts = title.rsplit(" - ", 1)
+                title = parts[0]
+                source = parts[1]
+
+            # Parse publish date
+            published = entry.get("published", "")
+
+            # Try to get image from description
+            desc = entry.get("description", "")
+            img_match = re.search(r'src="([^"]+)"', desc)
+            image_url = img_match.group(1) if img_match else None
+
+            # Clean description of HTML
+            clean_desc = re.sub(r'<[^>]+>', '', desc).strip()
+
+            articles.append({
+                "title": title,
+                "link": entry.get("link", ""),
+                "source": source,
+                "published": published,
+                "snippet": clean_desc[:200] if clean_desc else "",
+                "image_url": image_url,
+            })
+
+        NEWS_CACHE[cache_key] = (now, articles)
+        return articles
+    except Exception as e:
+        print(f"News fetch error: {e}")
+        return []
+
+
+async def summarize_article(url: str) -> dict:
+    """Fetch an article and generate an AI summary."""
+    if not claude:
+        return {"summary": "AI summary unavailable.", "key_points": [], "source_url": url}
+
+    # Fetch article content
+    article_text = ""
+    try:
+        resp = await http.get(url, follow_redirects=True, timeout=10)
+        html = resp.text
+        # Simple HTML text extraction
+        text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        article_text = text[:3000]  # Limit to avoid token overflow
+    except Exception:
+        article_text = ""
+
+    if len(article_text) < 100:
+        return {
+            "summary": "Could not fetch article content. Visit the original source to read the full article.",
+            "key_points": [],
+            "source_url": url,
+        }
+
+    prompt = f"""Summarize this article about ethical sourcing / sustainability in 2-3 paragraphs.
+Also extract 3-4 key bullet points.
+
+Article text:
+{article_text}
+
+Return ONLY valid JSON:
+{{
+  "summary": "<2-3 paragraph summary>",
+  "key_points": ["point 1", "point 2", "point 3"]
+}}"""
+
+    try:
+        response = claude.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            data = json.loads(text[start:end])
+            return {
+                "summary": data.get("summary", ""),
+                "key_points": data.get("key_points", []),
+                "source_url": url,
+            }
+    except Exception as e:
+        print(f"Article summary error: {e}")
+
+    return {"summary": "Summary generation failed.", "key_points": [], "source_url": url}
+
+
 # ── Scoring Engine ───────────────────────────────────────────────────
 
 def compute_ethic_score(
@@ -429,6 +608,11 @@ async def analyze(req: AnalyzeRequest):
         product_name, brand, ethic_score.overall_score, material_risks, opacity
     )
 
+    # 7. Suggest ethical alternatives
+    alternatives = ai_suggest_alternatives(
+        product_name, brand, category, ethic_score.overall_score
+    )
+
     # Parse ingredients list
     ingredients_list = []
     if ingredients_text:
@@ -444,6 +628,7 @@ async def analyze(req: AnalyzeRequest):
         opacity_audit=opacity,
         ethic_score=ethic_score,
         ai_summary=summary,
+        alternatives=alternatives,
     )
 
 
@@ -532,3 +717,47 @@ Output ONLY the JSON, nothing else.""",
         raise HTTPException(502, f"AI service error: {str(e)}")
     except json.JSONDecodeError:
         raise HTTPException(500, "AI returned invalid format")
+
+
+@app.get("/news")
+async def get_news(
+    category: str = Query("all", description="Category: all, food, fashion, beauty, tech, home, kids"),
+    limit: int = Query(10, ge=1, le=20),
+):
+    """Fetch real-time sustainability/ethical sourcing news."""
+    search_query = NEWS_QUERIES.get(category.lower(), NEWS_QUERIES["all"])
+    articles = await fetch_news_rss(search_query, count=limit)
+    return {"category": category, "count": len(articles), "articles": articles}
+
+
+@app.get("/news/summary")
+async def get_article_summary(url: str = Query(..., description="Article URL to summarize")):
+    """Generate an AI summary of a news article."""
+    result = await summarize_article(url)
+    return result
+
+
+@app.get("/news/for-you")
+async def get_personalized_news(
+    materials: str = Query("", description="Comma-separated materials from scan history"),
+    categories: str = Query("", description="Comma-separated product categories"),
+    limit: int = Query(10, ge=1, le=20),
+):
+    """Fetch personalized news based on user's scan history."""
+    # Build a personalized query from user's interests
+    terms = []
+    if materials:
+        mat_list = [m.strip() for m in materials.split(",") if m.strip()]
+        terms.extend(mat_list[:5])
+    if categories:
+        cat_list = [c.strip() for c in categories.split(",") if c.strip()]
+        terms.extend(cat_list[:3])
+
+    if not terms:
+        # Fall back to general ethical sourcing news
+        search_query = NEWS_QUERIES["all"]
+    else:
+        search_query = " ".join(terms) + " ethical sourcing sustainability"
+
+    articles = await fetch_news_rss(search_query, count=limit)
+    return {"personalized": True, "query_terms": terms, "count": len(articles), "articles": articles}

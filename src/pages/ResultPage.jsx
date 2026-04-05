@@ -1,10 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useSearchParams, useNavigate } from 'react-router-dom'
 import {
   ArrowLeft, Leaf, ShieldCheck, AlertTriangle, Loader2,
-  ChevronDown, ChevronUp, Globe, Baby, Link2, Sparkles
+  ChevronDown, ChevronUp, Globe, Baby, Link2, Sparkles,
+  ArrowRight, Star
 } from 'lucide-react'
 import { analyzeProduct } from '../api'
+import { useAuth } from '../contexts/AuthContext'
+import { saveScanResult } from '../lib/firestore'
 
 function ScoreRing({ score, size = 80 }) {
   const radius = (size - 8) / 2
@@ -130,15 +133,18 @@ function MaterialCard({ material }) {
 export default function ResultPage() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
+  const { user } = useAuth()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [result, setResult] = useState(null)
+  const savedRef = useRef(false)
 
   const barcode = searchParams.get('barcode')
   const productName = searchParams.get('name')
   const brand = searchParams.get('brand')
 
   useEffect(() => {
+    savedRef.current = false
     async function fetchAnalysis() {
       setLoading(true)
       setError(null)
@@ -149,6 +155,14 @@ export default function ResultPage() {
           brand: brand || undefined,
         })
         setResult(data)
+
+        // Save to Firestore if user is logged in
+        if (user && !savedRef.current) {
+          savedRef.current = true
+          saveScanResult(user.uid, data).catch(err =>
+            console.warn('Failed to save scan:', err)
+          )
+        }
       } catch (err) {
         setError(err.message)
       } finally {
@@ -156,7 +170,7 @@ export default function ResultPage() {
       }
     }
     fetchAnalysis()
-  }, [barcode, productName, brand])
+  }, [barcode, productName, brand, user])
 
   if (loading) {
     return (
@@ -330,6 +344,38 @@ export default function ResultPage() {
               <span key={i} className="text-[11px] text-gray-600 bg-gray-50 px-2 py-1 rounded-full">
                 {ing}
               </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Ethical Alternatives */}
+      {r.alternatives && r.alternatives.length > 0 && (
+        <div className="px-5 mb-4">
+          <h3 className="text-sm font-semibold text-gray-900 mb-3">
+            <span className="flex items-center gap-1.5">
+              <Star className="w-4 h-4 text-emerald-500" />
+              Better Alternatives
+            </span>
+          </h3>
+          <div className="flex gap-3 overflow-x-auto pb-2 -mx-5 px-5 scrollbar-hide">
+            {r.alternatives.map((alt, i) => (
+              <button
+                key={i}
+                onClick={() => navigate(`/result?name=${encodeURIComponent(alt.name)}&brand=${encodeURIComponent(alt.brand)}`)}
+                className="flex-shrink-0 w-[200px] bg-gradient-to-br from-emerald-50 to-teal-50 rounded-2xl
+                           p-4 border border-emerald-100 text-left active:scale-[0.98] transition-all"
+              >
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs font-bold text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded-full">
+                    ~{alt.estimated_score}/100
+                  </span>
+                  <ArrowRight className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+                <h4 className="text-sm font-semibold text-gray-900 leading-tight">{alt.name}</h4>
+                <p className="text-[11px] text-gray-500 mt-0.5">{alt.brand}</p>
+                <p className="text-[10px] text-emerald-700 mt-2 leading-relaxed">{alt.reason}</p>
+              </button>
             ))}
           </div>
         </div>

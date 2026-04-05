@@ -1,71 +1,10 @@
-import { useState, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2 } from 'lucide-react'
+import { Search, Camera, ScanBarcode, ChevronRight, Leaf, ShieldCheck, TrendingUp, X, Loader2, User } from 'lucide-react'
 import { searchProducts } from '../api'
 import ScanModal from '../components/ScanModal'
-
-const recentSearches = [
-  {
-    id: 1,
-    name: 'Organic Dark Chocolate',
-    brand: 'Green & Black\'s',
-    score: 82,
-    badge: 'VERIFIED GREEN',
-    badgeColor: 'bg-emerald-500',
-    image: 'https://images.unsplash.com/photo-1549007994-cb92caebd54b?w=300&h=400&fit=crop',
-    category: 'Food',
-  },
-  {
-    id: 2,
-    name: 'Cotton T-Shirt',
-    brand: 'H&M Conscious',
-    score: 45,
-    badge: 'MODERATE RISK',
-    badgeColor: 'bg-amber-500',
-    image: 'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?w=300&h=350&fit=crop',
-    category: 'Clothing',
-  },
-  {
-    id: 3,
-    name: 'Fair Trade Coffee',
-    brand: 'Equal Exchange',
-    score: 91,
-    badge: 'VERIFIED GREEN',
-    badgeColor: 'bg-emerald-500',
-    image: 'https://images.unsplash.com/photo-1559056199-641a0ac8b55e?w=300&h=450&fit=crop',
-    category: 'Food',
-  },
-  {
-    id: 4,
-    name: 'Running Shoes',
-    brand: 'Nike Air',
-    score: 38,
-    badge: 'HIGH RISK',
-    badgeColor: 'bg-red-500',
-    image: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=300&h=350&fit=crop',
-    category: 'Footwear',
-  },
-  {
-    id: 5,
-    name: 'Bamboo Toothbrush',
-    brand: 'Brush with Bamboo',
-    score: 95,
-    badge: 'VERIFIED GREEN',
-    badgeColor: 'bg-emerald-500',
-    image: 'https://images.unsplash.com/photo-1607613009820-a29f7bb81c04?w=300&h=380&fit=crop',
-    category: 'Personal Care',
-  },
-  {
-    id: 6,
-    name: 'Palm Oil Soap',
-    brand: 'Dr. Bronner\'s',
-    score: 72,
-    badge: 'MODERATE RISK',
-    badgeColor: 'bg-amber-500',
-    image: 'https://images.unsplash.com/photo-1600857544200-b2f666a9a2ec?w=300&h=420&fit=crop',
-    category: 'Personal Care',
-  },
-]
+import { useAuth } from '../contexts/AuthContext'
+import { getUserStats, getRecentScans } from '../lib/firestore'
 
 function ScoreRing({ score, size = 36 }) {
   const radius = (size - 6) / 2
@@ -91,6 +30,8 @@ function ScoreRing({ score, size = 36 }) {
 }
 
 function ProductCard({ product, index, onClick }) {
+  const hasImage = !!product.imageUrl
+
   return (
     <div
       className="break-inside-avoid mb-3 group fade-up cursor-pointer"
@@ -100,12 +41,20 @@ function ProductCard({ product, index, onClick }) {
       <div className="rounded-2xl overflow-hidden bg-white shadow-sm border border-gray-100
                       hover:shadow-md transition-all duration-300 active:scale-[0.98]">
         <div className="relative">
-          <img
-            src={product.image}
-            alt={product.name}
-            className="w-full object-cover"
-            loading="lazy"
-          />
+          {hasImage ? (
+            <img
+              src={product.imageUrl}
+              alt={product.productName}
+              className="w-full object-cover"
+              loading="lazy"
+            />
+          ) : (
+            <div
+              className="w-full aspect-[3/4] bg-gradient-to-br from-emerald-100 via-teal-50 to-green-100 flex items-center justify-center"
+            >
+              <Leaf className="w-10 h-10 text-emerald-300" />
+            </div>
+          )}
           <div className="absolute top-2 right-2">
             <ScoreRing score={product.score} />
           </div>
@@ -116,7 +65,7 @@ function ProductCard({ product, index, onClick }) {
           </div>
         </div>
         <div className="p-3">
-          <h3 className="text-sm font-semibold text-gray-900 leading-tight">{product.name}</h3>
+          <h3 className="text-sm font-semibold text-gray-900 leading-tight">{product.productName}</h3>
           <p className="text-xs text-gray-500 mt-0.5">{product.brand}</p>
           <div className="flex items-center gap-1 mt-1.5">
             <span className="text-[10px] text-gray-400 bg-gray-50 px-1.5 py-0.5 rounded-full">
@@ -131,12 +80,50 @@ function ProductCard({ product, index, onClick }) {
 
 export default function HomePage() {
   const navigate = useNavigate()
+  const { user, signIn } = useAuth()
   const [searchFocused, setSearchFocused] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState(null)
   const [searching, setSearching] = useState(false)
   const [scanOpen, setScanOpen] = useState(false)
   const [scanTab, setScanTab] = useState('barcode')
+
+  // Real data from Firestore
+  const [stats, setStats] = useState(null)
+  const [recentScans, setRecentScans] = useState([])
+  const [loadingScans, setLoadingScans] = useState(false)
+
+  // Fetch user stats and recent scans when user changes
+  useEffect(() => {
+    if (!user) {
+      setStats(null)
+      setRecentScans([])
+      return
+    }
+
+    let cancelled = false
+
+    async function fetchData() {
+      setLoadingScans(true)
+      try {
+        const [userStats, scans] = await Promise.all([
+          getUserStats(user.uid),
+          getRecentScans(user.uid, 6),
+        ])
+        if (!cancelled) {
+          setStats(userStats)
+          setRecentScans(scans)
+        }
+      } catch (err) {
+        console.error('Failed to fetch user data:', err)
+      } finally {
+        if (!cancelled) setLoadingScans(false)
+      }
+    }
+
+    fetchData()
+    return () => { cancelled = true }
+  }, [user])
 
   // Handle search submission
   const handleSearch = useCallback(async () => {
@@ -165,6 +152,30 @@ export default function HomePage() {
     setScanOpen(true)
   }
 
+  const statCards = [
+    {
+      icon: ShieldCheck,
+      label: 'Products\nScanned',
+      value: stats ? String(stats.scanCount) : '0',
+      color: 'text-emerald-600',
+      bg: 'bg-emerald-50',
+    },
+    {
+      icon: Leaf,
+      label: 'Ethical\nFinds',
+      value: stats ? String(stats.ethicalFinds) : '0',
+      color: 'text-green-600',
+      bg: 'bg-green-50',
+    },
+    {
+      icon: TrendingUp,
+      label: 'Impact\nScore',
+      value: stats ? stats.impactGrade : '--',
+      color: 'text-teal-600',
+      bg: 'bg-teal-50',
+    },
+  ]
+
   return (
     <div className="min-h-dvh">
       {/* Header */}
@@ -182,12 +193,35 @@ export default function HomePage() {
                 EthicLens
               </h1>
             </div>
-            <button
-              onClick={() => openScanner('barcode')}
-              className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
-                             hover:bg-gray-100 transition-colors">
-              <ScanBarcode className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => openScanner('barcode')}
+                className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
+                               hover:bg-gray-100 transition-colors">
+                <ScanBarcode className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
+              </button>
+              {user ? (
+                <button
+                  onClick={() => navigate('/profile')}
+                  className="w-8 h-8 rounded-full overflow-hidden border-2 border-emerald-400 flex-shrink-0"
+                >
+                  <img
+                    src={user.photoURL}
+                    alt="Profile"
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
+                </button>
+              ) : (
+                <button
+                  onClick={signIn}
+                  className="w-9 h-9 rounded-full bg-gray-50 flex items-center justify-center
+                                 hover:bg-gray-100 transition-colors"
+                >
+                  <User className="w-4.5 h-4.5 text-gray-600" strokeWidth={1.8} />
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Search bar */}
@@ -273,11 +307,7 @@ export default function HomePage() {
       {/* Quick Stats */}
       <div className="px-5 py-4">
         <div className="grid grid-cols-3 gap-2">
-          {[
-            { icon: ShieldCheck, label: 'Products\nScanned', value: '24', color: 'text-emerald-600', bg: 'bg-emerald-50' },
-            { icon: Leaf, label: 'Ethical\nFinds', value: '16', color: 'text-green-600', bg: 'bg-green-50' },
-            { icon: TrendingUp, label: 'Impact\nScore', value: 'A+', color: 'text-teal-600', bg: 'bg-teal-50' },
-          ].map((stat, i) => (
+          {statCards.map((stat, i) => (
             <div
               key={stat.label}
               className={`${stat.bg} rounded-2xl p-3 flex flex-col items-center gap-1.5 fade-up`}
@@ -320,20 +350,37 @@ export default function HomePage() {
       <div className="px-5">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-base font-semibold text-gray-900">Recent Searches</h2>
-          <button className="text-xs text-emerald-600 font-medium">See All</button>
+          {recentScans.length > 0 && (
+            <button className="text-xs text-emerald-600 font-medium">See All</button>
+          )}
         </div>
 
-        {/* Masonry Grid */}
-        <div className="columns-2 gap-3">
-          {recentSearches.map((product, index) => (
-            <ProductCard
-              key={product.id}
-              product={product}
-              index={index}
-              onClick={() => navigate(`/result?name=${encodeURIComponent(product.name)}&brand=${encodeURIComponent(product.brand)}`)}
-            />
-          ))}
-        </div>
+        {loadingScans ? (
+          <div className="flex items-center justify-center py-12">
+            <Loader2 className="w-6 h-6 text-emerald-500 animate-spin" />
+          </div>
+        ) : recentScans.length > 0 ? (
+          /* Masonry Grid */
+          <div className="columns-2 gap-3">
+            {recentScans.map((product, index) => (
+              <ProductCard
+                key={product.id}
+                product={product}
+                index={index}
+                onClick={() => navigate(`/result?name=${encodeURIComponent(product.productName)}&brand=${encodeURIComponent(product.brand)}`)}
+              />
+            ))}
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-12 text-center">
+            <div className="w-16 h-16 rounded-full bg-gray-100 flex items-center justify-center mb-3">
+              <Search className="w-7 h-7 text-gray-300" />
+            </div>
+            <p className="text-sm text-gray-400">
+              Scan your first product to see results here
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Bottom padding */}
